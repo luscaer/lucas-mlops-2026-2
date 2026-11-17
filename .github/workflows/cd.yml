@@ -1,0 +1,82 @@
+# .github/workflows/cd.yml
+name: CD
+
+on:
+  push:
+    tags: ['v*']                 # versão nova: git push origin v1.0.1
+  workflow_dispatch:             # rollback: botão "Run workflow"
+    inputs:
+      tag:
+        description: 'Tag já publicada no GHCR (ex.: v1.0.0)'
+        required: true
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}   # tag digitada ou tag enviada
+  APP_NAME: intent-clf
+
+jobs:
+  # 1. Roda o ci.yml inteiro (test + smoke) no commit da tag.
+  #    Só segue se tudo passar. No rollback, é pulado.
+  ci:
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/ci.yml
+    secrets: inherit             # o smoke precisa dos segredos do W&B e do Mongo
+
+  # 2. Constrói a imagem e publica no GHCR com a tag da versão
+  release:
+    needs: ci
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build e push com a versão
+        run: |
+          IMAGE=ghcr.io/luscaer/lucas-mlops-2026-2
+          docker build -t "$IMAGE:$TAG" .
+          docker push "$IMAGE:$TAG"
+
+  # 3. Troca a imagem na VM da AWS via SSH (espera aprovação)
+  deploy:
+    needs: release
+    if: ${{ !failure() && !cancelled() }}   # roda também no rollback (release pulado)
+    environment: production
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy da versão na VM via SSH
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$VM_SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=no "$VM_USER@$VM_HOST" \
+            "/usr/local/bin/deploy-intent-clf '$TAG'"
+
+  # 4. Testa a URL pública e confere se a versão certa está no ar
+  verify:
+    needs: deploy
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          URL=${{ vars.APP_URL }}
+          MSG='{"nome":"cd","text":"não entendi nada"}'
+          for _ in $(seq 90); do        # até 15 min (startup lento)
+            if curl -fsS "$URL/" | grep -q "\"$TAG\"" &&
+               curl -fsS -X POST "$URL/predictions" \
+                 -H "Content-Type: application/json" -d "$MSG"; then
+              echo "OK: $TAG no ar"; exit 0
+            fi
+            sleep 10
+          done
+          echo "Falhou: $TAG não respondeu. Faça o rollback."; exit 1
